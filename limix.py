@@ -1,11 +1,11 @@
 """
-MIXED MODEL ANALYSIS WITH GRM — glimix_core direct interface (v3)
+MIXED MODEL WITH GRM — categorical genotype + explicit DOMINANCE decomposition
+glimix_core direct interface
 
 Phenotype : microbe_abundance
-Fixed effects  : genotype, sex, cohort
-Random effects : GRM  (σ²_g,    separately estimated)
-                 Cage (σ²_cage, separately estimated)
-                 Noise (σ²_e,   separately estimated)
+Fixed     : sex, cohort, genotype
+Random    : GRM (σ²_g), Cage (σ²_cage), Noise (σ²_e)
+
 """
 
 import numpy as np
@@ -23,19 +23,17 @@ from numpy_sugar.linalg import economic_qs
 from glimix_core.lmm import LMM
 
 
-# FUNCTION: Read GCTA Binary GRM
+# ── GRM reader ────────────────────────────────────────────────────────────────
 def read_gcta_grm(grm_prefix):
     print(f"Reading GRM files with prefix: {grm_prefix}")
-    id_file  = grm_prefix + ".grm.id"
-    bin_file = grm_prefix + ".grm.bin"
-    grm_id   = pd.read_csv(id_file, sep="\t", header=None,
-                            names=["FID", "IID"], dtype=str)
-    n        = len(grm_id)
-    n_vals   = n * (n + 1) // 2
-    with open(bin_file, "rb") as fh:
+    grm_id = pd.read_csv(grm_prefix + ".grm.id", sep="\t", header=None,
+                         names=["FID", "IID"], dtype=str)
+    n      = len(grm_id)
+    n_vals = n * (n + 1) // 2
+    with open(grm_prefix + ".grm.bin", "rb") as fh:
         grm_vals = np.array(struct.unpack(f"{n_vals}f", fh.read(n_vals * 4)),
                             dtype=np.float64)
-    G = np.zeros((n, n), dtype=np.float64)
+    G = np.zeros((n, n))
     G[np.tril_indices(n)] = grm_vals
     G = G + G.T - np.diag(np.diag(G))
     print(f"  GRM: {n}x{n}, range [{G.min():.4f}, {G.max():.4f}]")
@@ -43,315 +41,268 @@ def read_gcta_grm(grm_prefix):
 
 
 def norm_K(K):
-    "Normalise K to unit mean diagonal."
     d = np.diag(K).mean()
     return K / d if d > 0 else K
 
 
+# ── two-random-effect LMM (GRM + cage) ────────────────────────────────────────
 def fit_lmm_two_re(y, M, K_grm, K_cage, label="", restricted=True):
- 
-    print(f"\n  [{label}] Fitting LMM with separate GRM + Cage random effects")
-
+    print(f"  [{label}] fitting (cols={M.shape[1]}, REML={restricted})")
     K_grm_n  = norm_K(K_grm)  + 1e-4 * np.eye(len(y))
     K_cage_n = norm_K(K_cage) + 1e-4 * np.eye(len(y))
 
     def lml_at_w(w):
         w = float(np.clip(w, 1e-6, 1 - 1e-6))
-        K_comb = w * K_grm_n + (1 - w) * K_cage_n
-        QS     = economic_qs(K_comb)
-        lmm    = LMM(y, M, QS, restricted=restricted)
+        QS  = economic_qs(w * K_grm_n + (1 - w) * K_cage_n)
+        lmm = LMM(y, M, QS, restricted=restricted)
         lmm.fit(verbose=False)
         return lmm.lml(), lmm
 
-    # Coarse grid search
     best_lml, best_lmm, best_w = -np.inf, None, 0.5
     for w in np.linspace(0.05, 0.95, 19):
         lml, lmm = lml_at_w(w)
         if lml > best_lml:
             best_lml, best_lmm, best_w = lml, lmm, w
 
-    # Scalar refinement around best grid point
-    lo = max(0.001, best_w - 0.1)
-    hi = min(0.999, best_w + 0.1)
-    opt = minimize_scalar(lambda w: -lml_at_w(w)[0],
-                          bounds=(lo, hi), method="bounded",
-                          options={"xatol": 1e-4})
+    lo, hi = max(0.001, best_w - 0.1), min(0.999, best_w + 0.1)
+    opt = minimize_scalar(lambda w: -lml_at_w(w)[0], bounds=(lo, hi),
+                          method="bounded", options={"xatol": 1e-4})
     lml_r, lmm_r = lml_at_w(opt.x)
     if lml_r > best_lml:
         best_lml, best_lmm, best_w = lml_r, lmm_r, float(opt.x)
 
-    # Recover variance components from glimix_core parameterisation
-    s     = best_lmm.scale
-    delta = best_lmm.delta
-    w     = best_w
-
-    sg    = s * (1 - delta) * w          # σ²_g
-    sc    = s * (1 - delta) * (1 - w)    # σ²_cage
-    se    = s * delta                     # σ²_e
+    s, delta, w = best_lmm.scale, best_lmm.delta, best_w
+    sg = s * (1 - delta) * w
+    sc = s * (1 - delta) * (1 - w)
+    se = s * delta
     total = sg + sc + se
-
-    print(f"    w_opt (GRM weight)  = {w:.4f}")
-    print(f"    σ²_g    (GRM)       = {sg:.6f}  ({100*sg/total:.1f}%)")
-    print(f"    σ²_cage (Cage)      = {sc:.6f}  ({100*sc/total:.1f}%)")
-    print(f"    σ²_e    (Noise)     = {se:.6f}  ({100*se/total:.1f}%)")
-    print(f"    LML                 = {best_lml:.4f}")
-
-    return {"lml": best_lml, "sigma2_g": sg, "sigma2_cage": sc,
-            "sigma2_e": se, "total_var": total, "h2": sg / total,
-            "beta": np.array(best_lmm.beta), "w_opt": w, "lmm": best_lmm}
+    return {"lml": best_lml, "sigma2_g": sg, "sigma2_cage": sc, "sigma2_e": se,
+            "total_var": total, "h2": sg / total, "beta": np.array(best_lmm.beta),
+            "w_opt": w, "lmm": best_lmm}
 
 
-# 1. LOAD PHENOTYPE DATA
-print("\n" + "="*70)
-print("LOADING DATA")
-print("="*70)
-
+# ── 1. LOAD DATA ──────────────────────────────────────────────────────────────
+print("\n" + "=" * 70 + "\nLOADING DATA\n" + "=" * 70)
 data = pd.read_csv("microbe_abundance.csv", dtype={"rfid": str})
 data = data.dropna(subset=["rfid", "sex", "cohort", "cage",
-                            "microbe_abundance", "genotype"])
-data["rfid"] = data["rfid"].astype(str)
+                           "microbe_abundance", "genotype"])
 
-ref_candidates = [g for g in data["genotype"].unique() if "ref" in g.lower()]
-ref_level = ref_candidates[0] if ref_candidates else data["genotype"].unique()[0]
-print(f"Reference genotype: {ref_level}")
+# Order genotype biologically: homo_REF (ref) -> HET -> homo_ALT.
+def pick(patterns, levels):
+    for p in patterns:
+        for lv in levels:
+            if p.lower() in lv.lower():
+                return lv
+    return None
 
+levels   = list(data["genotype"].unique())
+homo_ref = pick(["homo_ref", "homref", "ref/ref", "0/0"], levels) or levels[0]
+het      = pick(["het", "ref/alt", "0/1", "1/0"], levels)
+homo_alt = pick(["homo_alt", "homalt", "alt/alt", "1/1"], levels)
+geno_order = [g for g in [homo_ref, het, homo_alt] if g] + \
+             [g for g in levels if g not in (homo_ref, het, homo_alt)]
+
+data["genotype"] = pd.Categorical(data["genotype"], categories=geno_order,
+                                   ordered=True)
+print(f"Genotype order (reference first): {geno_order}")
 print("\n=== MICROBE ABUNDANCE BY GENOTYPE ===")
-print(data.groupby("genotype")["microbe_abundance"].agg(
-    n="count", mean="mean", sd="std", median="median"))
+print(data.groupby("genotype", observed=True)["microbe_abundance"]
+          .agg(n="count", mean="mean", sd="std", median="median"))
 
-# 2. LOAD GRM
-print("\n" + "="*70)
-print("LOADING GRM")
-print("="*70)
-
+# ── 2. GRM ────────────────────────────────────────────────────────────────────
+print("\n" + "=" * 70 + "\nLOADING GRM\n" + "=" * 70)
 try:
     G_full, grm_ids = read_gcta_grm("my_subset_no_chr10")
     use_grm = True
 except FileNotFoundError as e:
-    print(f"WARNING: {e} — using identity matrix")
+    print(f"WARNING: {e} — using identity matrix (no GRM file present)")
     use_grm = False
 
-# 3. ALIGN SAMPLES
-print("\n" + "="*70)
-print("ALIGNING SAMPLES")
-print("="*70)
-
+# ── 3. ALIGN ──────────────────────────────────────────────────────────────────
+print("\n" + "=" * 70 + "\nALIGNING SAMPLES\n" + "=" * 70)
 if use_grm:
-    common_ids = list(set(data["rfid"]) & set(grm_ids))
-    print(f"Phenotype : {data['rfid'].nunique()} | GRM: {len(grm_ids)} | Common: {len(common_ids)}")
-    if len(common_ids) == 0:
-        raise ValueError("No matching IDs!")
-    data_matched = data.set_index("rfid").loc[common_ids].reset_index()
-    grm_order    = [grm_ids.index(s) for s in common_ids]
-    G_sub        = G_full[np.ix_(grm_order, grm_order)]
+    common = list(set(data["rfid"]) & set(grm_ids))
+    if not common:
+        raise ValueError("No matching IDs between phenotype and GRM!")
+    data_m   = data.set_index("rfid").loc[common].reset_index()
+    order    = [grm_ids.index(s) for s in common]
+    G_sub    = G_full[np.ix_(order, order)]
 else:
-    data_matched = data.copy()
-    common_ids   = data_matched["rfid"].tolist()
-    G_sub        = np.eye(len(common_ids))
-
-n = len(common_ids)
+    data_m = data.copy()
+    G_sub  = np.eye(len(data_m))
+data_m["genotype"] = pd.Categorical(data_m["genotype"], categories=geno_order,
+                                    ordered=True)
+n = len(data_m)
 print(f"Final dataset: {n} individuals")
 
-
-# 4. CAGE COVARIANCE  K_cage = Z_cage @ Z_cage.T
-le_cage  = LabelEncoder()
-cage_enc = le_cage.fit_transform(data_matched["cage"].values)
-n_cages  = len(le_cage.classes_)
-Z_cage   = np.zeros((n, n_cages), dtype=np.float64)
+# ── 4. CAGE COVARIANCE ────────────────────────────────────────────────────────
+cage_enc = LabelEncoder().fit_transform(data_m["cage"].values)
+Z_cage   = np.zeros((n, cage_enc.max() + 1))
 Z_cage[np.arange(n), cage_enc] = 1.0
 K_cage   = Z_cage @ Z_cage.T
-print(f"\nCages: {n_cages},  K_cage: {K_cage.shape}")
+n_cages  = Z_cage.shape[1]
+print(f"Cages: {n_cages}")
 
-# 5. COVARIATE MATRICES
-sex_dummies      = pd.get_dummies(data_matched["sex"],      drop_first=True, prefix="sex")
-cohort_dummies   = pd.get_dummies(data_matched["cohort"],   drop_first=True, prefix="cohort")
-genotype_dummies = pd.get_dummies(data_matched["genotype"], drop_first=True, prefix="genotype")
-
+# ── 5. DESIGN MATRICES (genotype as additive + dominance contrasts) ───────────
+sex_d    = pd.get_dummies(data_m["sex"],    drop_first=True, prefix="sex").values.astype(float)
+cohort_d = pd.get_dummies(data_m["cohort"], drop_first=True, prefix="cohort").values.astype(float)
 intercept = np.ones((n, 1))
-M_null = np.hstack([intercept, sex_dummies.values,
-                    cohort_dummies.values]).astype(np.float64)
-M_full = np.hstack([intercept, sex_dummies.values,
-                    cohort_dummies.values,
-                    genotype_dummies.values]).astype(np.float64)
-y = data_matched["microbe_abundance"].values.astype(np.float64)
 
-print(f"\nM_null: {M_null.shape}  |  M_full: {M_full.shape}")
+code_a = {homo_ref: -1.0, het: 0.0, homo_alt: 1.0}   # additive
+code_d = {homo_ref:  0.0, het: 1.0, homo_alt: 0.0}   # dominance (het indicator)
+a = data_m["genotype"].map(code_a).to_numpy(dtype=float).reshape(-1, 1)
+d = data_m["genotype"].map(code_d).to_numpy(dtype=float).reshape(-1, 1)
 
-# 6. FIT NULL AND FULL MODELS
-print("\n" + "="*70)
-print("FITTING MODELS (ML for LRT, REML for Variance Components)")
-print("="*70)
+nuisance = np.hstack([intercept, sex_d, cohort_d])    # intercept + sex + cohort
+M_null = nuisance                                      # no genotype
+M_add  = np.hstack([nuisance, a])                      # additive only
+M_full = np.hstack([nuisance, a, d])                   # additive + dominance
+y = data_m["microbe_abundance"].values.astype(float)
+n_nuis = nuisance.shape[1]
+print(f"M_null {M_null.shape} | M_add {M_add.shape} | M_full {M_full.shape}")
 
-# 1. Fit with ML (restricted=False) for a statistically valid LRT
-res_null_ml = fit_lmm_two_re(y, M_null, G_sub, K_cage, label="null_ML", restricted=False)
-res_full_ml = fit_lmm_two_re(y, M_full, G_sub, K_cage, label="full_ML", restricted=False)
+# ── 6. FIT ────────────────────────────────────────────────────────────────────
+print("\n" + "=" * 70 + "\nFITTING (ML for LRTs, REML for variance components)\n" + "=" * 70)
+ml_null = fit_lmm_two_re(y, M_null, G_sub, K_cage, "null_ML", restricted=False)
+ml_add  = fit_lmm_two_re(y, M_add,  G_sub, K_cage, "add_ML",  restricted=False)
+ml_full = fit_lmm_two_re(y, M_full, G_sub, K_cage, "full_ML", restricted=False)
+reml_full = fit_lmm_two_re(y, M_full, G_sub, K_cage, "full_REML", restricted=True)
 
-# 2. Fit Full Model with REML (restricted=True) for unbiased variance components
-res_full_reml = fit_lmm_two_re(y, M_full, G_sub, K_cage, label="full_REML", restricted=True)
-res_null_reml = fit_lmm_two_re(y, M_null, G_sub, K_cage, label="null_REML", restricted=True)
+# ── 7. LIKELIHOOD-RATIO TESTS ─────────────────────────────────────────────────
+print("\n" + "=" * 70 + "\nLIKELIHOOD-RATIO TESTS\n" + "=" * 70)
+def lrt(lml_alt, lml_null, df):
+    stat = 2.0 * (lml_alt - lml_null)
+    return stat, chi2_dist.sf(max(stat, 0.0), df)
 
-# 7. LIKELIHOOD RATIO TEST (Using ML models, df=1)
-print("\n" + "="*70)
-print("GLOBAL GENOTYPE P-VALUE (LRT on ML Likelihoods, df=1)")
-print("="*70)
+chi_geno, p_geno = lrt(ml_full["lml"], ml_null["lml"], df=2)  # overall genotype
+chi_add,  p_add  = lrt(ml_add["lml"],  ml_null["lml"], df=1)  # additive trend
+chi_dom,  p_dom  = lrt(ml_full["lml"], ml_add["lml"],  df=1)  # DOMINANCE
 
-lml_null       = res_null_ml["lml"]
-lml_full       = res_full_ml["lml"]
-lrt_stat       = 2.0 * (lml_full - lml_null)
-lrt_pval       = chi2_dist.sf(lrt_stat, df=1)
+print(f"  Overall genotype  : chi2={chi_geno:7.3f}  df=2  p={p_geno:.4e}")
+print(f"  Additive trend    : chi2={chi_add:7.3f}  df=1  p={p_add:.4e}")
+print(f"  DOMINANCE         : chi2={chi_dom:7.3f}  df=1  p={p_dom:.4e}")
 
-print(f"  LML null (ML) : {lml_null:.4f}")
-print(f"  LML full (ML) : {lml_full:.4f}")
-print(f"  χ²            : {lrt_stat:.4f}  (df=1)")
-print(f"  p-value       : {lrt_pval:.4e}")
+# ── 8. EFFECT SIZES & DEGREE OF DOMINANCE (from REML full model) ──────────────
+beta = reml_full["beta"]
+b_a  = beta[n_nuis]        # additive coefficient
+b_d  = beta[n_nuis + 1]    # dominance deviation (HET - homozygote midpoint)
+k    = b_d / abs(b_a) if b_a != 0 else np.nan
 
-sig_label = ("*** HIGHLY SIGNIFICANT" if lrt_pval < 0.001 else
-             "** VERY SIGNIFICANT"    if lrt_pval < 0.01  else
-             "* SIGNIFICANT"          if lrt_pval < 0.05  else
-             "NOT SIGNIFICANT")
-print(f"  {sig_label}")
+if   abs(k) < 0.25: dom_class = "≈ additive (no/weak dominance)"
+elif abs(k) < 0.75: dom_class = "partial dominance"
+elif abs(k) <= 1.25: dom_class = "≈ complete dominance"
+else:                dom_class = "overdominance"
+toward = (homo_alt if (b_d * b_a) > 0 else homo_ref) if b_a != 0 else "neither"
 
-pval_label = (f"p = {lrt_pval:.2e}"           if lrt_pval < 0.001 else
-              f"p = {lrt_pval:.4f}"            if lrt_pval < 0.05  else
-              f"p = {lrt_pval:.3f} (n.s.)")
+print("\n" + "=" * 70 + "\nEFFECT SIZES\n" + "=" * 70)
+print(f"  additive  b_a = {b_a:10.3f}  (per-allele half-effect)")
+print(f"  dominance b_d = {b_d:10.3f}  (HET minus homozygote midpoint)")
+print(f"  degree of dominance k = b_d/|b_a| = {k:.3f}  -> {dom_class}")
+print(f"  heterozygote leans toward: {toward}")
 
-# 8. VARIANCE COMPONENTS SUMMARY (Using REML model)
-print("\n" + "="*70)
-print("VARIANCE COMPONENTS (Full Model - REML)")
-print("="*70)
+# ── 9. VARIANCE COMPONENTS (REML full) ────────────────────────────────────────
+vc, tv = reml_full, reml_full["total_var"]
+print("\n" + "=" * 70 + "\nVARIANCE COMPONENTS (REML)\n" + "=" * 70)
+print(f"  σ²_g (GRM)   = {vc['sigma2_g']:.4f} ({100*vc['sigma2_g']/tv:.1f}%)")
+print(f"  σ²_cage      = {vc['sigma2_cage']:.4f} ({100*vc['sigma2_cage']/tv:.1f}%)")
+print(f"  σ²_e (noise) = {vc['sigma2_e']:.4f} ({100*vc['sigma2_e']/tv:.1f}%)")
+print(f"  h² (SNP)     = {vc['h2']:.4f}")
 
-vc = res_full_reml
-tv = vc["total_var"]
-print(f"  σ²_g    (GRM)   = {vc['sigma2_g']:.6f}  ({100*vc['sigma2_g']/tv:.1f}%)")
-print(f"  σ²_cage (Cage)  = {vc['sigma2_cage']:.6f}  ({100*vc['sigma2_cage']/tv:.1f}%)")
-print(f"  σ²_e    (Noise) = {vc['sigma2_e']:.6f}  ({100*vc['sigma2_e']/tv:.1f}%)")
-print(f"  SNP heritability h² = {vc['h2']:.4f}")
+# ── 10. ADJUSTED VALUES: remove sex+cohort+random effects, keep genotype ──────
+K_grm_n  = norm_K(G_sub)  + 1e-4 * np.eye(n)
+K_cage_n = norm_K(K_cage) + 1e-4 * np.eye(n)
+K_comb   = vc["w_opt"] * K_grm_n + (1 - vc["w_opt"]) * K_cage_n
+s, delta = reml_full["lmm"].scale, reml_full["lmm"].delta
+V        = s * (1 - delta) * K_comb + s * delta * np.eye(n)
+resid    = y - M_full @ beta
+u_hat    = s * (1 - delta) * K_comb @ np.linalg.solve(V, resid)   # BLUP
 
+nuis_fit = nuisance @ beta[:n_nuis]            # sex + cohort + intercept
+y_adj    = y - (nuis_fit - beta[0]) - u_hat    # keep intercept + genotype + noise
+data_m["y_adj"] = y_adj
 
-# 9. ADJUSTED PHENOTYPE VALUES
-beta_null   = res_null_reml["beta"]
-fitted_null = M_null[:, :len(beta_null)] @ beta_null
-y_adjusted  = (y - fitted_null) + y.mean()
-
-data_matched = data_matched.copy()
-data_matched["y_adjusted"] = y_adjusted
-
-adj_means = (data_matched.groupby("genotype")["y_adjusted"]
-             .mean().reset_index()
-             .rename(columns={"y_adjusted": "adjusted_mean"}))
+adj_means = (data_m.groupby("genotype", observed=True)["y_adj"].mean()
+             .reset_index().rename(columns={"y_adj": "adjusted_mean"}))
+midpoint = 0.5 * (adj_means.loc[adj_means.genotype == homo_ref, "adjusted_mean"].values[0] +
+                  adj_means.loc[adj_means.genotype == homo_alt, "adjusted_mean"].values[0])
 print("\nAdjusted genotype means:")
 print(adj_means.to_string(index=False))
+print(f"Homozygote midpoint (additive expectation for HET): {midpoint:.1f}")
 
-# 10. VISUALISATION
-subtitle  = "glimix_core LMM: GRM + Cage as separate random effects"
-all_genos = data_matched["genotype"].unique().tolist()
+# ── 11. PLOT ──────────────────────────────────────────────────────────────────
+palette = {homo_ref: "#4C72B0", het: "#55A868", homo_alt: "#C44E52"}
+fig, ax = plt.subplots(figsize=(8.2, 6))
+pos = list(range(1, len(geno_order) + 1))
 
-def find_geno(patterns, candidates):
-    for pat in patterns:
-        for c in candidates:
-            if pat.lower() in c.lower():
-                return c
-    return None
-
-homo_ref = find_geno(["homo_ref","homref","ref/ref","0/0"], all_genos) or ref_level
-het      = find_geno(["het","ref/alt","0/1","1/0"], all_genos)
-homo_alt = find_geno(["homo_alt","homalt","alt/alt","1/1"], all_genos)
-
-geno_order = [g for g in [homo_ref, het, homo_alt] if g is not None]
-for g in all_genos:
-    if g not in geno_order:
-        geno_order.append(g)
-
-palette    = ["#4C72B0", "#55A868", "#C44E52", "#808080"]
-box_colors = {g: palette[min(i, len(palette)-1)] for i, g in enumerate(geno_order)}
-
-fig, ax  = plt.subplots(figsize=(8, 6))
-positions = list(range(1, len(geno_order) + 1))
-
-bp = ax.boxplot(
-    [data_matched.loc[data_matched["genotype"] == g, "y_adjusted"].values
-     for g in geno_order],
-    positions=positions, patch_artist=True, widths=0.45,
-    medianprops=dict(color="black", linewidth=2),
-    whiskerprops=dict(linewidth=1.2), capprops=dict(linewidth=1.2),
-    showfliers=False)
-
-for patch, geno in zip(bp["boxes"], geno_order):
-    patch.set_facecolor(box_colors[geno])
-    patch.set_alpha(0.6)
+bp = ax.boxplot([data_m.loc[data_m.genotype == g, "y_adj"].values for g in geno_order],
+                positions=pos, patch_artist=True, widths=0.5,
+                medianprops=dict(color="black", linewidth=2),
+                whiskerprops=dict(linewidth=1.2), capprops=dict(linewidth=1.2),
+                showfliers=False)
+for patch, g in zip(bp["boxes"], geno_order):
+    patch.set_facecolor(palette.get(g, "#808080")); patch.set_alpha(0.55)
 
 rng = np.random.default_rng(42)
-for pos, geno in zip(positions, geno_order):
-    vals   = data_matched.loc[data_matched["genotype"] == geno, "y_adjusted"].values
-    jitter = rng.uniform(-0.15, 0.15, size=len(vals))
-    ax.scatter(pos + jitter, vals, color=box_colors[geno],
-               alpha=0.85, s=30, edgecolors="white", linewidths=0.4, zorder=3)
+for p_, g in zip(pos, geno_order):
+    v = data_m.loc[data_m.genotype == g, "y_adj"].values
+    ax.scatter(p_ + rng.uniform(-0.16, 0.16, v.size), v, color=palette.get(g, "#808080"),
+               alpha=0.8, s=28, edgecolors="white", linewidths=0.4, zorder=3)
+for p_, g in zip(pos, geno_order):
+    m = adj_means.loc[adj_means.genotype == g, "adjusted_mean"].values[0]
+    ax.scatter(p_, m, marker="D", s=90, color="white",
+               edgecolors=palette.get(g, "#808080"), linewidths=2, zorder=5)
 
-for pos, geno in zip(positions, geno_order):
-    adj_m = adj_means.loc[adj_means["genotype"] == geno, "adjusted_mean"].values[0]
-    ax.scatter(pos, adj_m, marker="D", s=80,
-               color="white", edgecolors=box_colors[geno], linewidths=2, zorder=5)
+# Additive expectation line: connect the two homozygote means; HET deviation = dominance
+ax.plot([pos[0], pos[-1]],
+        [adj_means.loc[adj_means.genotype == homo_ref, "adjusted_mean"].values[0],
+         adj_means.loc[adj_means.genotype == homo_alt, "adjusted_mean"].values[0]],
+        "--", color="grey", linewidth=1.4, zorder=2, label="Additive expectation")
+het_mean = adj_means.loc[adj_means.genotype == het, "adjusted_mean"].values[0]
+het_pos  = pos[geno_order.index(het)]
+ax.annotate("", xy=(het_pos, het_mean), xytext=(het_pos, midpoint),
+            arrowprops=dict(arrowstyle="<->", color="black", lw=1.6))
+ax.text(het_pos + 0.12, 0.5 * (het_mean + midpoint),
+        f"dominance\nb_d = {b_d:.0f}\nk = {k:.2f}", fontsize=9, va="center")
 
-ax.legend(handles=[Line2D([0],[0], marker="D", color="w",
-                          markerfacecolor="white", markeredgecolor="black",
-                          markersize=9, label="Adjusted mean")],
-          loc="upper right", framealpha=0.8)
-ax.set_xticks(positions)
-ax.set_xticklabels(geno_order, fontsize=11)
+ax.legend(handles=[Line2D([0], [0], marker="D", color="w", markerfacecolor="white",
+                          markeredgecolor="black", markersize=9, label="Adjusted mean"),
+                   Line2D([0], [0], color="grey", ls="--", label="Additive expectation")],
+          loc="upper right", framealpha=0.85)
+ax.set_xticks(pos); ax.set_xticklabels(geno_order, fontsize=11)
 ax.set_xlabel("Genotype", fontsize=12)
-ax.set_ylabel("Microbe Abundance (adjusted)", fontsize=12)
-ax.set_title(f"Microbe Abundance by Genotype\n{subtitle}",
+ax.set_ylabel("Microbe abundance (adjusted)", fontsize=12)
+ax.set_title("Microbe abundance by genotype — dominance view\n"
+             "Categorical genotype; GRM + cage as random effects",
              fontweight="bold", fontsize=11)
-ax.text(0.97, 0.97, pval_label, transform=ax.transAxes,
-        ha="right", va="top", fontsize=11,
-        bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow",
+txt = (f"genotype p = {p_geno:.2e}\ndominance p = {p_dom:.2e}\n{dom_class}"
+       if p_geno < 0.001 else
+       f"genotype p = {p_geno:.3f}\ndominance p = {p_dom:.3f}\n{dom_class}")
+ax.text(0.03, 0.97, txt, transform=ax.transAxes, ha="left", va="top", fontsize=10,
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="lightyellow",
                   edgecolor="grey", alpha=0.9))
-ax.spines["top"].set_visible(False)
-ax.spines["right"].set_visible(False)
+ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
 plt.tight_layout()
-plt.savefig("limix_microbe_abundance_with_grm_df1.png", dpi=300)
-print("\nSaved: limix_microbe_abundance_with_grm_df1.png")
+plt.savefig("dominance_microbe_abundance.png", dpi=300)
 plt.close()
+print("\nSaved: dominance_microbe_abundance.png")
 
-# 11. EXPORT
-pd.DataFrame([{
-    "test": "Global genotype effect (LRT, df=1)",
-    "lml_null": lml_null, "lml_full": lml_full,
-    "lrt_statistic": lrt_stat, "df": 1,
-    "p_value": lrt_pval, "significant": lrt_pval < 0.05
-}]).to_csv("limix_genotype_lrt_results_df1.csv", index=False)
+# ── 12. EXPORT ────────────────────────────────────────────────────────────────
+pd.DataFrame([
+    {"test": "Overall genotype", "df": 2, "chi2": chi_geno, "p_value": p_geno},
+    {"test": "Additive trend",   "df": 1, "chi2": chi_add,  "p_value": p_add},
+    {"test": "Dominance",        "df": 1, "chi2": chi_dom,  "p_value": p_dom},
+]).to_csv("dominance_lrt_results.csv", index=False)
 
-pd.DataFrame({
-    "component" : ["GRM (σ²_g)", "Cage (σ²_cage)", "Residual (σ²_e)"],
-    "variance"  : [vc["sigma2_g"], vc["sigma2_cage"], vc["sigma2_e"]],
-    "proportion": [vc["sigma2_g"]/tv, vc["sigma2_cage"]/tv, vc["sigma2_e"]/tv]
-}).to_csv("limix_variance_components_df1.csv", index=False)
+pd.DataFrame([{"additive_b_a": b_a, "dominance_b_d": b_d, "degree_of_dominance_k": k,
+               "classification": dom_class, "het_leans_toward": toward,
+               "homozygote_midpoint": midpoint}]).to_csv("dominance_effects.csv", index=False)
 
-adj_means.to_csv("limix_genotype_means_df1.csv", index=False)
+pd.DataFrame({"component": ["GRM", "Cage", "Residual"],
+              "variance": [vc["sigma2_g"], vc["sigma2_cage"], vc["sigma2_e"]],
+              "proportion": [vc["sigma2_g"]/tv, vc["sigma2_cage"]/tv, vc["sigma2_e"]/tv]
+              }).to_csv("dominance_variance_components.csv", index=False)
 
-with open("limix_model_summary_df1.txt", "w") as fh:
-    fh.write("="*70 + "\n")
-    fh.write("MIXED MODEL — SEPARATE GRM + CAGE (glimix_core LMM)\n")
-    fh.write("Matches: Tonnelé et al. 2025, Nature Communications\n")
-    fh.write("="*70 + "\n\n")
-    fh.write(f"n={n}, cages={n_cages}, genotypes={data_matched['genotype'].nunique()}\n\n")
-    fh.write("Variance Components (Full Model):\n")
-    fh.write(f"  σ²_g    = {vc['sigma2_g']:.6f} ({100*vc['sigma2_g']/tv:.1f}%)\n")
-    fh.write(f"  σ²_cage = {vc['sigma2_cage']:.6f} ({100*vc['sigma2_cage']/tv:.1f}%)\n")
-    fh.write(f"  σ²_e    = {vc['sigma2_e']:.6f} ({100*vc['sigma2_e']/tv:.1f}%)\n")
-    fh.write(f"  h²      = {vc['h2']:.4f}\n\n")
-    fh.write(f"LRT: χ²={lrt_stat:.4f}, df=1, p={lrt_pval:.4e}\n\n")
-    fh.write("Adjusted Genotype Means:\n")
-    fh.write(adj_means.to_string(index=False) + "\n")
-
-print("Saved: limix_genotype_lrt_results_df1.csv")
-print("Saved: limix_variance_components_df1.csv")
-print("Saved: limix_genotype_means_df1.csv")
-print("Saved: limix_model_summary_df1.txt")
-
-print("\n" + "="*70)
-print("COMPLETE")
-print("="*70)
-print(f"✓ Separate GRM + Cage random effects via glimix_core LMM")
-print(f"✓ Global genotype p-value (LRT, df=1): {lrt_pval:.4e}")
-print(f"✓ SNP heritability h²: {vc['h2']:.4f}")
+adj_means.to_csv("dominance_genotype_means.csv", index=False)
+print("Saved: dominance_lrt_results.csv, dominance_effects.csv, "
+      "dominance_variance_components.csv, dominance_genotype_means.csv")
+print("\n" + "=" * 70 + "\nDONE\n" + "=" * 70)
