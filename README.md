@@ -224,6 +224,7 @@ pip install pandas-plink pyliftover
 
 If you use this code, please cite:
 > Sadegi et al. (2026) "Replication of Host St6galnac1-Microbiome Association Across Distinct Experimental Conditions in Heterogeneous Stock Rats"
+
 > Tonnelé et al. (2025). "Genetic architecture and mechanisms of host-microbiome interactions from a multi-cohort analysis of outbred laboratory rats". Nature Communications, 10126. https://doi.org/10.1038/s41467-025-66105-z
 
 Dominance classification methodology:
