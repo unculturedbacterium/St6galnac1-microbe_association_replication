@@ -23,7 +23,7 @@ from numpy_sugar.linalg import economic_qs
 from glimix_core.lmm import LMM
 
 
-# ── GRM reader ────────────────────────────────────────────────────────────────
+#GRM reader
 def read_gcta_grm(grm_prefix):
     print(f"Reading GRM files with prefix: {grm_prefix}")
     grm_id = pd.read_csv(grm_prefix + ".grm.id", sep="\t", header=None,
@@ -45,7 +45,7 @@ def norm_K(K):
     return K / d if d > 0 else K
 
 
-# ── two-random-effect LMM (GRM + cage) ────────────────────────────────────────
+# two-random-effect LMM (GRM + cage)
 def fit_lmm_two_re(y, M, K_grm, K_cage, label="", restricted=True):
     print(f"  [{label}] fitting (cols={M.shape[1]}, REML={restricted})")
     K_grm_n  = norm_K(K_grm)  + 1e-4 * np.eye(len(y))
@@ -81,7 +81,7 @@ def fit_lmm_two_re(y, M, K_grm, K_cage, label="", restricted=True):
             "w_opt": w, "lmm": best_lmm}
 
 
-# ── 1. LOAD DATA ──────────────────────────────────────────────────────────────
+# LOAD DATA
 print("\n" + "=" * 70 + "\nLOADING DATA\n" + "=" * 70)
 data = pd.read_csv("microbe_abundance.csv", dtype={"rfid": str})
 data = data.dropna(subset=["rfid", "sex", "cohort", "cage",
@@ -109,7 +109,7 @@ print("\n=== MICROBE ABUNDANCE BY GENOTYPE ===")
 print(data.groupby("genotype", observed=True)["microbe_abundance"]
           .agg(n="count", mean="mean", sd="std", median="median"))
 
-# ── 2. GRM ────────────────────────────────────────────────────────────────────
+# GRM
 print("\n" + "=" * 70 + "\nLOADING GRM\n" + "=" * 70)
 try:
     G_full, grm_ids = read_gcta_grm("my_subset_no_chr10")
@@ -118,7 +118,7 @@ except FileNotFoundError as e:
     print(f"WARNING: {e} — using identity matrix (no GRM file present)")
     use_grm = False
 
-# ── 3. ALIGN ──────────────────────────────────────────────────────────────────
+# ALIGN 
 print("\n" + "=" * 70 + "\nALIGNING SAMPLES\n" + "=" * 70)
 if use_grm:
     common = list(set(data["rfid"]) & set(grm_ids))
@@ -135,7 +135,7 @@ data_m["genotype"] = pd.Categorical(data_m["genotype"], categories=geno_order,
 n = len(data_m)
 print(f"Final dataset: {n} individuals")
 
-# ── 4. CAGE COVARIANCE ────────────────────────────────────────────────────────
+# CAGE COVARIANCE 
 cage_enc = LabelEncoder().fit_transform(data_m["cage"].values)
 Z_cage   = np.zeros((n, cage_enc.max() + 1))
 Z_cage[np.arange(n), cage_enc] = 1.0
@@ -143,7 +143,7 @@ K_cage   = Z_cage @ Z_cage.T
 n_cages  = Z_cage.shape[1]
 print(f"Cages: {n_cages}")
 
-# ── 5. DESIGN MATRICES (genotype as additive + dominance contrasts) ───────────
+# DESIGN MATRICES (genotype as additive + dominance contrasts)
 sex_d    = pd.get_dummies(data_m["sex"],    drop_first=True, prefix="sex").values.astype(float)
 cohort_d = pd.get_dummies(data_m["cohort"], drop_first=True, prefix="cohort").values.astype(float)
 intercept = np.ones((n, 1))
@@ -161,14 +161,14 @@ y = data_m["microbe_abundance"].values.astype(float)
 n_nuis = nuisance.shape[1]
 print(f"M_null {M_null.shape} | M_add {M_add.shape} | M_full {M_full.shape}")
 
-# ── 6. FIT ────────────────────────────────────────────────────────────────────
+# 6. FIT
 print("\n" + "=" * 70 + "\nFITTING (ML for LRTs, REML for variance components)\n" + "=" * 70)
 ml_null = fit_lmm_two_re(y, M_null, G_sub, K_cage, "null_ML", restricted=False)
 ml_add  = fit_lmm_two_re(y, M_add,  G_sub, K_cage, "add_ML",  restricted=False)
 ml_full = fit_lmm_two_re(y, M_full, G_sub, K_cage, "full_ML", restricted=False)
 reml_full = fit_lmm_two_re(y, M_full, G_sub, K_cage, "full_REML", restricted=True)
 
-# ── 7. LIKELIHOOD-RATIO TESTS ─────────────────────────────────────────────────
+# LIKELIHOOD-RATIO TESTS
 print("\n" + "=" * 70 + "\nLIKELIHOOD-RATIO TESTS\n" + "=" * 70)
 def lrt(lml_alt, lml_null, df):
     stat = 2.0 * (lml_alt - lml_null)
@@ -182,7 +182,7 @@ print(f"  Overall genotype  : chi2={chi_geno:7.3f}  df=2  p={p_geno:.4e}")
 print(f"  Additive trend    : chi2={chi_add:7.3f}  df=1  p={p_add:.4e}")
 print(f"  DOMINANCE         : chi2={chi_dom:7.3f}  df=1  p={p_dom:.4e}")
 
-# ── 8. EFFECT SIZES & DEGREE OF DOMINANCE (from REML full model) ──────────────
+# EFFECT SIZES & DEGREE OF DOMINANCE (from REML full model) 
 beta = reml_full["beta"]
 b_a  = beta[n_nuis]        # additive coefficient
 b_d  = beta[n_nuis + 1]    # dominance deviation (HET - homozygote midpoint)
@@ -200,7 +200,7 @@ print(f"  dominance b_d = {b_d:10.3f}  (HET minus homozygote midpoint)")
 print(f"  degree of dominance k = b_d/|b_a| = {k:.3f}  -> {dom_class}")
 print(f"  heterozygote leans toward: {toward}")
 
-# ── 9. VARIANCE COMPONENTS (REML full) ────────────────────────────────────────
+# VARIANCE COMPONENTS (REML full)
 vc, tv = reml_full, reml_full["total_var"]
 print("\n" + "=" * 70 + "\nVARIANCE COMPONENTS (REML)\n" + "=" * 70)
 print(f"  σ²_g (GRM)   = {vc['sigma2_g']:.4f} ({100*vc['sigma2_g']/tv:.1f}%)")
@@ -208,7 +208,7 @@ print(f"  σ²_cage      = {vc['sigma2_cage']:.4f} ({100*vc['sigma2_cage']/tv:.1
 print(f"  σ²_e (noise) = {vc['sigma2_e']:.4f} ({100*vc['sigma2_e']/tv:.1f}%)")
 print(f"  h² (SNP)     = {vc['h2']:.4f}")
 
-# ── 10. ADJUSTED VALUES: remove sex+cohort+random effects, keep genotype ──────
+# ADJUSTED VALUES: remove sex+cohort+random effects, keep genotype 
 K_grm_n  = norm_K(G_sub)  + 1e-4 * np.eye(n)
 K_cage_n = norm_K(K_cage) + 1e-4 * np.eye(n)
 K_comb   = vc["w_opt"] * K_grm_n + (1 - vc["w_opt"]) * K_cage_n
@@ -229,7 +229,7 @@ print("\nAdjusted genotype means:")
 print(adj_means.to_string(index=False))
 print(f"Homozygote midpoint (additive expectation for HET): {midpoint:.1f}")
 
-# ── 11. PLOT ──────────────────────────────────────────────────────────────────
+# PLOT
 palette = {homo_ref: "#4C72B0", het: "#55A868", homo_alt: "#C44E52"}
 fig, ax = plt.subplots(figsize=(8.2, 6))
 pos = list(range(1, len(geno_order) + 1))
@@ -286,7 +286,7 @@ plt.savefig("dominance_microbe_abundance.png", dpi=300)
 plt.close()
 print("\nSaved: dominance_microbe_abundance.png")
 
-# ── 12. EXPORT ────────────────────────────────────────────────────────────────
+# EXPORT
 pd.DataFrame([
     {"test": "Overall genotype", "df": 2, "chi2": chi_geno, "p_value": p_geno},
     {"test": "Additive trend",   "df": 1, "chi2": chi_add,  "p_value": p_add},
