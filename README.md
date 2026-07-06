@@ -102,7 +102,7 @@ The GRM weight (`w`) is jointly optimized over a grid + scalar refinement. Genot
 
 ---
 
-### 4. Dominance Analysis (`dominance_all.py`)
+### 4. Dominance Analysis
 
 Extends the LMM above with a dominance classification following **Cui et al. 2023 (*Genome Biology*)**.
 
