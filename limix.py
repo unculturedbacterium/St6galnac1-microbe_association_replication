@@ -1,12 +1,10 @@
-"""
-MIXED MODEL WITH GRM — categorical genotype + explicit DOMINANCE decomposition
+MIXED MODEL WITH GRM; categorical genotype + explicit DOMINANCE decomposition
 glimix_core direct interface
 
 Phenotype : microbe_abundance
 Fixed     : sex, cohort, genotype
 Random    : GRM (σ²_g), Cage (σ²_cage), Noise (σ²_e)
 
-"""
 
 import numpy as np
 import pandas as pd
